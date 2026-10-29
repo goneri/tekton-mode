@@ -36,3 +36,7 @@ the `*tekton log*` buffer.
 (require 'tekton)
 (tekton-image-info-mode 1)
 ```
+
+## License
+
+GPL-3.0-or-later — see [LICENSE](LICENSE).
