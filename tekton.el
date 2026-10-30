@@ -212,6 +212,7 @@ When done, displays an overlay above BOL's line (as a marker, so it
 follows edits) and records it for the periodic refresh.  Never
 blocks Emacs; failures are reported in the minibuffer."
   (let* ((ref (concat name "@" pinned))
+         (bol (save-excursion (goto-char bol) (line-beginning-position)))
          (marker (copy-marker bol))
          (buf (current-buffer)))
     (cl-pushnew (cons ref marker) tekton--pending :key #'car :test #'equal)
@@ -308,11 +309,35 @@ never blocks.  References already displayed or in progress are
 skipped."
   (interactive)
   (with-current-buffer (or buffer (current-buffer))
+    (tekton--cleanup-overlays)
     (save-excursion
       (goto-char (point-min))
       (while (re-search-forward "[^ \t()\"'=]+@sha256:[0-9a-f]\\{64\\}" nil t)
         (let ((ref (match-string-no-properties 0)))
           (tekton--launch ref (copy-marker (line-beginning-position))))))))
+
+(defun tekton--cleanup-overlays ()
+  "Delete overlays whose image reference disappeared from the buffer.
+
+Called from the idle timer, so stale overlays vanish about a
+second after the reference they describe is removed or rewritten."
+  (dolist (entry tekton--overlays)
+    (pcase-let ((`(,ref . ,marker) entry))
+      (let ((pos (marker-position marker)))
+        (when (and pos
+                   (save-excursion
+                     (goto-char pos)
+                     (not (search-forward ref (line-end-position) t))))
+          ;; Reference gone: drop the overlay and its bookkeeping.
+          (dolist (ov (overlays-in (save-excursion
+                                     (goto-char pos) (line-beginning-position))
+                                   (save-excursion
+                                     (goto-char pos) (line-end-position))))
+            (when (overlay-get ov 'tekton-info)
+              (delete-overlay ov)))
+          (setq tekton--overlays
+                (cl-remove ref tekton--overlays
+                           :key #'car :test #'equal)))))))
 
 (defun tekton--refresh-all ()
   "Re-inspect every displayed overlay in every buffer."
@@ -341,6 +366,7 @@ skipped."
 
 (defun tekton--idle-check ()
   "Show image info if point is idle on a line with an image reference."
+  (tekton--cleanup-overlays)
   (unless (minibufferp)
     (let ((ref (save-excursion
                  (goto-char (line-beginning-position))
