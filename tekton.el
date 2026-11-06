@@ -418,14 +418,14 @@ second after the reference they describe is removed or rewritten."
     (tekton-scan-buffer)))
 
 
-(defvar tekton--last-ref nil
-  "Last image reference for which info was displayed automatically.")
-
 (defvar tekton--idle-timer nil
   "Idle timer used to debounce automatic image info display.")
 
 (defun tekton--idle-check ()
-  "Show image info if point is idle on a line with an image reference."
+  "Show image info if point is idle on a line with an image reference.
+References that already have an overlay (e.g. from the file-visit
+scan) or an inspection in flight are skipped: the per-buffer
+overlay bookkeeping is the cache."
   (tekton--cleanup-overlays)
   (unless (minibufferp)
     (let ((ref (save-excursion
@@ -433,16 +433,12 @@ second after the reference they describe is removed or rewritten."
                  (when (re-search-forward "[^ \t()\"'=]+@sha256:[0-9a-f]\\{64\\}"
                                           (line-end-position) t)
                    (match-string-no-properties 0)))))
-      (when (and ref (not (equal ref tekton--last-ref)))
+      (when (and ref (not (tekton--displayed-or-pending-p ref)))
         (condition-case _err
-            (progn
-              (tekton-image-info)
-              ;; Only remember the ref on success, so a transient
-              ;; failure is retried next time.
-              (setq tekton--last-ref ref))
+            (tekton-image-info)
           (error
            (tekton--log "tekton: auto info failed: %s"
-                    (error-message-string _err))))))))
+                        (error-message-string _err))))))))
 
 (defun tekton-image-info-status ()
   "Report why automatic image info may not be triggering."
@@ -454,13 +450,12 @@ second after the reference they describe is removed or rewritten."
                                               (line-end-position) t)
                       (match-string-no-properties 0)))))
     (message
-     "mode: %s | timer: %s | ref on line: %s | last ref: %s"
+     "mode: %s | timer: %s | ref on line: %s | cache: %s"
      (if on-p "ON" "OFF")
      (if tekton--idle-timer "running" "NONE")
      (or (and line-ref (concat (substring line-ref 0 40) "...")) "none")
-     (or (and tekton--last-ref
-              (concat (substring tekton--last-ref 0 40) "..."))
-         "none"))))
+     (format "%d displayed / %d pending in buffer"
+             (length tekton--overlays) (length tekton--pending)))))
 
 (defvar tekton--refresh-timer nil
   "Periodic timer that refreshes all displayed overlays.")
