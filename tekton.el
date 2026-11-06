@@ -210,68 +210,89 @@ Buffer-local.")
   "Asynchronously fetch info for image NAME/PINNED.
 When done, displays an overlay above BOL's line (as a marker, so it
 follows edits) and records it for the periodic refresh.  Never
-blocks Emacs; failures are reported in the minibuffer."
+blocks Emacs.
+
+Two skopeo processes run in parallel: one resolves the tag to its
+current digest (for the latest-check), the other inspects the
+pinned digest itself (for the image's age)."
   (let* ((ref (concat name "@" pinned))
          (bol (save-excursion (goto-char bol) (line-beginning-position)))
          (marker (copy-marker bol))
-         (buf (current-buffer)))
+         (buf (current-buffer))
+         (tag-digest :pending)
+         (created-time :pending))
     (cl-pushnew (cons ref marker) tekton--pending :key #'car :test #'equal)
     (tekton--log "Inspecting %s..." name)
-    (tekton--start-process
-     "skopeo" (list "inspect" "--format" "{{.Created}} {{.Digest}}"
-                    (concat "docker://" name))
-     (lambda (code stdout stderr)
-       (when (buffer-live-p buf)
-         (with-current-buffer buf
-           (tekton--inspect-finish name pinned marker code stdout stderr)))))))
+    (let ((maybe-finish
+           (lambda ()
+             (when (and (not (eq tag-digest :pending))
+                        (not (eq created-time :pending)))
+               (when (buffer-live-p buf)
+                 (with-current-buffer buf
+                   (tekton--display ref pinned marker created-time tag-digest)))))))
+      ;; The registry's current digest for the tag (latest check).
+      (tekton--start-process
+       "skopeo" (list "inspect" "--format" "{{.Digest}}" (concat "docker://" name))
+       (lambda (code stdout _stderr)
+         (setq tag-digest
+               (let ((d (string-trim stdout)))
+                 (if (and (zerop code)
+                          (string-match-p "^sha256:[0-9a-f]\\{64\\}$" d))
+                     d
+                   nil)))
+         (funcall maybe-finish)))
+      ;; The pinned image's creation date (its age).  Note: skopeo
+      ;; rejects references with both a tag and a digest, so strip
+      ;; the tag and address the image by digest only.
+      (let ((repo (replace-regexp-in-string ":[^:/@]+$" "" name)))
+        (tekton--start-process
+         "skopeo" (list "inspect" "--format" "{{.Created}}"
+                        (concat "docker://" repo "@" pinned))
+       (lambda (code stdout _stderr)
+         (let* ((out (string-trim stdout))
+                (created (and (zerop code)
+                              (string-match
+                               "^\\([0-9-]+ [0-9:.]+\\([0-9]*\\) ?\\+?[0-9]* ?[A-Z]*\\)$"
+                               out)
+                              (match-string 1 out))))
+           (if (and created
+                    (not (time-less-p (date-to-time created)
+                                      (encode-time 0 0 0 1 1 2000))))
+               (progn
+                 (setq created-time (date-to-time created))
+                 (funcall maybe-finish))
+             ;; Bogus or missing date (Tekton bundle): recover the build
+             ;; time from the pinned digest's attestation.
+             (tekton--attestation-time-async
+              name pinned
+              (lambda (att-time)
+                (setq created-time att-time) ; nil if unavailable
+                (funcall maybe-finish)))))))))))
 
-(defun tekton--inspect-finish (name pinned marker code stdout stderr)
-  "Handle the skopeo inspect result for NAME/PINNED."
-  (let* ((ref (concat name "@" pinned))
-         (created (and (zerop code)
-                       (string-match
-                        "^\\([0-9-]+ [0-9:.]+\\([0-9]*\\) ?\\+?[0-9]* ?[A-Z]*\\) " stdout)
-                       (match-string 1 stdout)))
-         (digest (and (string-match "sha256:[0-9a-f]\\{64\\}" stdout)
-                      (match-string 0 stdout))))
-    (if (not (and created digest))
-        (progn
-          (tekton--pending-remove ref)
-          (tekton--log "tekton: inspection of %s failed: %s"
-                   name (if (and (not (string-empty-p (or stdout "")))
-                                 (not (string-empty-p stderr)))
-                            (concat (string-trim stdout) "; " stderr)
-                          (or (and (not (string-empty-p (or stdout "")))
-                                   (string-trim stdout))
-                              stderr "skopeo error"))))
-      (let ((created-time (date-to-time created)))
-        (if (time-less-p created-time (encode-time 0 0 0 1 1 2000))
-            ;; Bogus epoch-zero date: Tekton bundle, fetch the
-            ;; attestation asynchronously.
-            (tekton--attestation-time-async
-             name digest
-             (lambda (att-time)
-               (when (buffer-live-p (marker-buffer marker))
-                 (with-current-buffer (marker-buffer marker)
-                   (tekton--display ref pinned marker
-                                       (or att-time created-time) digest)))))
-          (tekton--display ref pinned marker created-time digest))))))
-
-(defun tekton--display (ref pinned marker created-time digest)
-  "Display the info overlay for REF and record it."
+(defun tekton--display (ref pinned marker created-time tag-digest)
+  "Display the info overlay for REF and record it.
+CREATED-TIME is the pinned image's creation time (nil if unknown);
+TAG-DIGEST the registry's current digest for the tag (nil on
+failure)."
   (let* ((name (substring ref 0 (- (length ref) (length pinned) 1)))
          (bol (marker-position marker))
-         (bogus-p (time-less-p created-time (encode-time 0 0 0 1 1 2000)))
-         (latest-p (string-equal-ignore-case digest pinned))
+         (latest-p (and tag-digest
+                        (string-equal-ignore-case tag-digest pinned)))
          (ov (and bol
                   (tekton--overlay-message
                    (format "Image is %s | %s"
-                           (if bogus-p
-                               "of UNKNOWN age (no creation date)"
+                           (if (or (null created-time)
+                                   (time-less-p created-time
+                                                (encode-time 0 0 0 1 1 2000)))
+                               "of UNKNOWN age"
                              (concat (tekton--human-age created-time) " old"))
-                           (if latest-p
-                               "This is the LATEST image for this tag"
-                             (format "OUTDATED: registry has %s" digest)))
+                           (cond
+                            ((null tag-digest)
+                             "status UNKNOWN (skopeo failed)")
+                            (latest-p
+                             "This is the LATEST image for this tag")
+                            (t
+                             (format "OUTDATED: registry has %s" tag-digest))))
                    bol latest-p))))
     (tekton--pending-remove ref)
     (when ov
