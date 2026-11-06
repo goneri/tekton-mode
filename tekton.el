@@ -6,7 +6,7 @@
 ;; Version: 0.1
 ;; Package-Requires: ((emacs "27.1"))
 ;; Keywords: tools, tekton, konflux, containers
-;; URL: https://github.com/goneri/tekton-emacs
+;; URL: https://github.com/goneri/tekton-mode
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
