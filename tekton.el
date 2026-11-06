@@ -79,6 +79,16 @@ anywhere on a `value:' line and still trigger."
             (list (match-string 1 ref) (match-string 2 ref) b e)
           (user-error "Reference %S has no @sha256 digest part" ref))))))
 
+(defun tekton--overlay-text (text bol &optional green)
+  "Return TEXT propertized for display above the line at BOL."
+  (let ((indent (save-excursion
+                  (goto-char bol)
+                  (current-indentation))))
+    (propertize (concat (make-string indent ?\s) text "\n")
+                'face (if green
+                          '(:foreground "green" :weight bold)
+                        '(:foreground "orange" :weight bold)))))
+
 (defun tekton--overlay-message (text &optional pos green)
   "Display TEXT as a persistent overlay before POS's line.
 The overlay is anchored at the beginning of the line containing POS
@@ -89,20 +99,46 @@ reference is inspected again.  Returns the overlay."
   (let* ((bol (save-excursion
                 (goto-char (or pos (point)))
                 (line-beginning-position)))
-         (indent (save-excursion
-                   (goto-char bol)
-                   (current-indentation)))
          (ov (make-overlay bol bol)))
     ;; Replace any previous info overlay on this line.
     (dolist (old (overlays-in bol bol))
       (when (overlay-get old 'tekton-info)
+        (tekton--spinner-stop old)
         (delete-overlay old)))
     (overlay-put ov 'tekton-info t)
-    (overlay-put ov 'before-string
-                 (propertize (concat (make-string indent ?\s) text "\n")
-                             'face (if green
-                                      '(:foreground "green" :weight bold)
-                                    '(:foreground "orange" :weight bold))))
+    (overlay-put ov 'before-string (tekton--overlay-text text bol green))
+    ov))
+
+(defvar tekton--spinner-frames
+  ["⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏"]
+  "Animation frames used by the fetching placeholder.")
+
+(defun tekton--spinner-stop (ov)
+  "Cancel the spinner timer of overlay OV, if any."
+  (when-let ((timer (overlay-get ov 'tekton-spinner)))
+    (cancel-timer timer)
+    (overlay-put ov 'tekton-spinner nil)))
+
+(defun tekton--spinner-start (bol)
+  "Show an animated placeholder above BOL's line.
+The placeholder is replaced by the real info overlay when the
+inspection finishes; its timer stops itself if the overlay is
+deleted in the meantime.  Returns the overlay."
+  (let* ((ov (tekton--overlay-message "⠋ fetching image info..." bol))
+         (idx 0))
+    (overlay-put
+     ov 'tekton-spinner
+     (run-with-timer 0.1 0.1
+                     (lambda ()
+                       (if (not (overlay-buffer ov))
+                           (tekton--spinner-stop ov)
+                         (setq idx (mod (1+ idx) (length tekton--spinner-frames)))
+                         (overlay-put
+                          ov 'before-string
+                          (tekton--overlay-text
+                           (concat (aref tekton--spinner-frames idx)
+                                   " fetching image info...")
+                           (overlay-start ov)))))))
     ov))
 
 (defun tekton--log (format-string &rest args)
@@ -223,6 +259,8 @@ pinned digest itself (for the image's age)."
          (created-time :pending))
     (cl-pushnew (cons ref marker) tekton--pending :key #'car :test #'equal)
     (tekton--log "Inspecting %s..." name)
+    ;; Immediate placeholder while the async inspections run.
+    (tekton--spinner-start (marker-position marker))
     (let ((maybe-finish
            (lambda ()
              (when (and (not (eq tag-digest :pending))
@@ -355,6 +393,7 @@ second after the reference they describe is removed or rewritten."
                                    (save-excursion
                                      (goto-char pos) (line-end-position))))
             (when (overlay-get ov 'tekton-info)
+              (tekton--spinner-stop ov)
               (delete-overlay ov)))
           (setq tekton--overlays
                 (cl-remove ref tekton--overlays
